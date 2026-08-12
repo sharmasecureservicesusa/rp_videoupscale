@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
-# Process GPU tasks
+# Process GPU tasks sequentially per worker
 executor = ThreadPoolExecutor(max_workers=1)
 
 # Nebius S3 Config
@@ -49,6 +49,7 @@ print("Real-ESRGAN Loaded Successfully!")
 
 
 def upload_to_s3(local_path: str, filename: str) -> str:
+    """Uploads upscaled chunk back to Nebius S3 and generates a presigned URL."""
     s3_key = f"outputs/{filename}"
     s3_client.upload_file(local_path, S3_BUCKET, s3_key)
     return s3_client.generate_presigned_url(
@@ -81,13 +82,26 @@ def process_video_sync(job_input: dict) -> dict:
             for chunk in res.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        # 2. Extract frames using FFmpeg
+        # 2. Extract original video FPS to prevent audio/video desync
+        try:
+            fps_cmd = [
+                "ffprobe", "-v", "0", "-of", "csv=p=0",
+                "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+                str(input_video)
+            ]
+            fps = subprocess.check_output(fps_cmd).decode().strip()
+            if not fps:
+                fps = "30"
+        except Exception:
+            fps = "30"
+
+        # 3. Extract frames using FFmpeg
         subprocess.run([
             "ffmpeg", "-y", "-i", str(input_video),
             "-q:v", "1", str(frames_in_dir / "frame_%08d.jpg")
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # 3. Upscale each frame using Real-ESRGAN in PyTorch
+        # 4. Upscale each frame using Real-ESRGAN in PyTorch
         in_frames = sorted(list(frames_in_dir.glob("*.jpg")))
         for frame_path in in_frames:
             img = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
@@ -96,9 +110,10 @@ def process_video_sync(job_input: dict) -> dict:
             output_img, _ = upsampler.enhance(img, outscale=scale)
             cv2.imwrite(str(frames_out_dir / frame_path.name), output_img)
 
-        # 4. Reassemble upscaled frames into video
+        # 5. Reassemble upscaled frames into video using original FPS and audio
         subprocess.run([
             "ffmpeg", "-y",
+            "-framerate", fps,
             "-i", str(frames_out_dir / "frame_%08d.jpg"),
             "-i", str(input_video),
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -106,7 +121,7 @@ def process_video_sync(job_input: dict) -> dict:
             str(output_video)
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # 5. Upload upscaled chunk to Nebius
+        # 6. Upload upscaled chunk to Nebius S3
         output_url = upload_to_s3(str(output_video), f"{job_id}_upscaled.mp4")
         return {"upscaled_video_url": output_url}
 
