@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install runtime Python dependencies
+# Install runtime Python dependencies (includes scipy and pyyaml for BasicSR)
 RUN pip install --no-cache-dir \
     opencv-python-headless \
     boto3 \
@@ -22,7 +22,9 @@ RUN pip install --no-cache-dir \
     requests \
     runpod \
     gdown \
-    torchvision
+    torchvision \
+    scipy \
+    pyyaml
 
 # Install BasicSR and RealESRGAN without dependencies to prevent package conflicts
 RUN pip install --no-cache-dir --no-deps basicsr
