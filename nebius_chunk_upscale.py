@@ -8,10 +8,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-# Load environment configuration
 load_dotenv()
 
-# --- CONFIGURATION ---
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 ENDPOINT_ID = os.getenv("ENDPOINT_ID")
 
@@ -21,11 +19,11 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-north1")
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "https://storage.eu-north1.nebius.cloud:443")
 
-NEBIUS_INPUT_PREFIX = "inputs/"      # Folder in Nebius containing raw videos
-NEBIUS_OUTPUT_PREFIX = "upscaled/"  # Folder in Nebius for finished videos
+NEBIUS_INPUT_PREFIX = "inputs/"
+NEBIUS_OUTPUT_PREFIX = "upscaled/"
 
-CHUNK_DURATION = 60                  # Duration of each segment in seconds
-MAX_WORKERS = 5                      # Parallel jobs dispatched to RunPod
+CHUNK_DURATION = 60
+MAX_WORKERS = 5
 
 BASE_DIR = Path("./workspace_temp")
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -33,7 +31,6 @@ CHUNK_DIR = BASE_DIR / "chunks"
 UPSCALED_CHUNK_DIR = BASE_DIR / "upscaled_chunks"
 OUTPUT_DIR = BASE_DIR / "outputs"
 
-# Initialize Nebius S3 Client
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -49,14 +46,12 @@ RUNPOD_HEADERS = {
 
 
 def download_from_nebius(s3_key: str, local_path: Path):
-    """Downloads a file from Nebius S3 to local storage."""
-    print(f"--> Downloading '{s3_key}' from Nebius...")
+    print(f"--> Downloading '{s3_key}' from Nebius...", flush=True)
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3_client.download_file(S3_BUCKET, s3_key, str(local_path))
 
 
 def upload_to_nebius(local_path: Path, s3_key: str) -> str:
-    """Uploads a local file to Nebius S3 and returns a presigned URL."""
     s3_client.upload_file(str(local_path), S3_BUCKET, s3_key)
     return s3_client.generate_presigned_url(
         "get_object",
@@ -65,10 +60,16 @@ def upload_to_nebius(local_path: Path, s3_key: str) -> str:
     )
 
 
+def delete_from_nebius(s3_key: str):
+    try:
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+    except Exception as e:
+        print(f"--> Warning: Failed to delete '{s3_key}': {e}", flush=True)
+
+
 def split_video(input_file: Path, segment_time: int) -> list[Path]:
-    """Splits a video file into stream-copied segments using FFmpeg."""
     CHUNK_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"--> Chunking '{input_file.name}' into {segment_time}s segments...")
+    print(f"--> Chunking '{input_file.name}' into {segment_time}s segments...", flush=True)
 
     chunk_pattern = CHUNK_DIR / "chunk_%04d.mp4"
     cmd = [
@@ -81,16 +82,14 @@ def split_video(input_file: Path, segment_time: int) -> list[Path]:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     chunks = sorted(list(CHUNK_DIR.glob("chunk_*.mp4")))
-    print(f"--> Created {len(chunks)} chunk(s).")
+    print(f"--> Created {len(chunks)} chunk(s).", flush=True)
     return chunks
 
 
 def process_single_chunk(chunk_path: Path) -> Path:
-    """Uploads chunk to Nebius, triggers RunPod endpoint with credentials, polls, and downloads result."""
     s3_chunk_key = f"temp_chunks/{chunk_path.name}"
     input_url = upload_to_nebius(chunk_path, s3_chunk_key)
 
-    # Dispatch job to RunPod with credentials passed in payload
     run_endpoint = f"https://api.runpod.ai/v2/{ENDPOINT_ID}/run"
     payload = {
         "input": {
@@ -109,34 +108,49 @@ def process_single_chunk(chunk_path: Path) -> Path:
     if not job_id:
         raise RuntimeError(f"[{chunk_path.name}] Failed to start RunPod job: {res}")
 
-    print(f"[{chunk_path.name}] Processing (Job ID: {job_id})...")
+    print(f"[{chunk_path.name}] Dispatched to RunPod (Job ID: {job_id})", flush=True)
 
-    # Poll job status until completion
     status_endpoint = f"https://api.runpod.ai/v2/{ENDPOINT_ID}/status/{job_id}"
+    start_time = time.time()
+    max_wait_seconds = 720  # 12 minutes timeout per chunk
+
     while True:
-        status_res = requests.get(status_endpoint, headers=RUNPOD_HEADERS).json()
-        status = status_res.get("status")
+        elapsed = time.time() - start_time
+        if elapsed > max_wait_seconds:
+            raise TimeoutError(f"[{chunk_path.name}] RunPod Job {job_id} timed out after {max_wait_seconds} seconds.")
 
-        if status == "COMPLETED":
-            output_url = status_res["output"]["upscaled_video_url"]
-            out_file_path = UPSCALED_CHUNK_DIR / f"upscaled_{chunk_path.name}"
+        try:
+            status_res = requests.get(status_endpoint, headers=RUNPOD_HEADERS, timeout=10).json()
+            status = status_res.get("status")
 
-            # Download upscaled chunk locally
-            video_bytes = requests.get(output_url).content
-            with open(out_file_path, "wb") as f:
-                f.write(video_bytes)
+            if status == "COMPLETED":
+                output_url = status_res["output"]["upscaled_video_url"]
+                out_file_path = UPSCALED_CHUNK_DIR / f"upscaled_{chunk_path.name}"
 
-            print(f"[{chunk_path.name}] Chunk upscaled successfully.")
-            return out_file_path
+                video_bytes = requests.get(output_url, timeout=60).content
+                with open(out_file_path, "wb") as f:
+                    f.write(video_bytes)
 
-        elif status in ["FAILED", "CANCELLED"]:
-            raise RuntimeError(f"[{chunk_path.name}] Job failed: {status_res}")
+                delete_from_nebius(s3_chunk_key)
+                delete_from_nebius(f"outputs/{job_id}_upscaled.mp4")
+
+                print(f"[{chunk_path.name}] Chunk upscaled successfully.", flush=True)
+                return out_file_path
+
+            elif status in ["FAILED", "CANCELLED"]:
+                raise RuntimeError(f"[{chunk_path.name}] RunPod Job failed: {status_res}")
+
+            elif status in ["IN_QUEUE", "IN_PROGRESS"]:
+                if int(elapsed) % 30 == 0:
+                    print(f"[{chunk_path.name}] Status: {status} ({int(elapsed)}s elapsed)", flush=True)
+
+        except requests.RequestException as e:
+            print(f"[{chunk_path.name}] Network warning: {e}", flush=True)
 
         time.sleep(5)
 
 
 def merge_videos(upscaled_chunks: list[Path], output_file: Path):
-    """Concatenates upscaled segments back into a single video file."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     concat_list = BASE_DIR / "concat_list.txt"
 
@@ -155,58 +169,58 @@ def merge_videos(upscaled_chunks: list[Path], output_file: Path):
 
 
 def cleanup_temp_dirs():
-    """Removes local temporary workspace folders."""
     if BASE_DIR.exists():
         shutil.rmtree(BASE_DIR)
 
 
 def process_nebius_pipeline():
-    # Fetch raw video list from Nebius S3
     response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=NEBIUS_INPUT_PREFIX)
     if "Contents" not in response:
-        print(f"No video files found in bucket '{S3_BUCKET}' under prefix '{NEBIUS_INPUT_PREFIX}'.")
+        print(f"No video files found in '{S3_BUCKET}/{NEBIUS_INPUT_PREFIX}'.", flush=True)
         return
 
     video_keys = [
         obj["Key"] for obj in response["Contents"]
-        if obj["Key"].lower().endswith((".mp4", ".mov", ".mkv", ".avi"))
+        if obj["Key"].rstrip("/").lower().endswith((".mp4", ".mov", ".mkv", ".avi"))
+        and obj.get("Size", 0) > 0
     ]
 
-    print(f"Found {len(video_keys)} video(s) in Nebius storage to process.\n")
+    if not video_keys:
+        print(f"No valid videos found under '{NEBIUS_INPUT_PREFIX}'.", flush=True)
+        return
+
+    print(f"Found {len(video_keys)} video(s) to process.\n", flush=True)
 
     for index, s3_video_key in enumerate(video_keys, start=1):
-        filename = Path(s3_video_key).name
-        print(f"=== [{index}/{len(video_keys)}] Processing Video: {filename} ===")
+        clean_key = s3_video_key.rstrip("/")
+        filename = Path(clean_key).name
+        print(f"=== [{index}/{len(video_keys)}] Processing Video: {filename} ===", flush=True)
 
         cleanup_temp_dirs()
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         UPSCALED_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Step A: Download full video from Nebius
         local_raw_path = DOWNLOAD_DIR / filename
         download_from_nebius(s3_video_key, local_raw_path)
 
-        # Step B: Split locally into 60s chunks
         chunks = split_video(local_raw_path, CHUNK_DURATION)
 
-        # Step C: Dispatch chunks to RunPod in parallel
-        print(f"--> Sending {len(chunks)} chunk(s) across {MAX_WORKERS} parallel workers...")
+        print(f"--> Dispatching {len(chunks)} chunk(s) across {MAX_WORKERS} workers...", flush=True)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             upscaled_chunks = list(executor.map(process_single_chunk, chunks))
 
-        # Step D: Merge upscaled chunks into final video file
-        local_final_path = OUTPUT_DIR / f"upscaled_{filename}"
+        local_final_path = OUTPUT_DIR / filename
         merge_videos(upscaled_chunks, local_final_path)
 
-        # Step E: Upload final upscaled video back to Nebius
-        nebius_output_key = f"{NEBIUS_OUTPUT_PREFIX}upscaled_{filename}"
-        print(f"--> Uploading finished video to Nebius: '{nebius_output_key}'...")
+        nebius_output_key = f"{NEBIUS_OUTPUT_PREFIX}{filename}"
+        print(f"--> Uploading finished video: '{nebius_output_key}'...", flush=True)
         upload_to_nebius(local_final_path, nebius_output_key)
 
-        print(f"=== Successfully Completed: {filename} ===\n")
+        delete_from_nebius(s3_video_key)
+        print(f"=== Successfully Completed & Removed Original: {filename} ===\n", flush=True)
 
     cleanup_temp_dirs()
-    print("All bucket processing tasks complete!")
+    print("All tasks complete!", flush=True)
 
 
 if __name__ == "__main__":
