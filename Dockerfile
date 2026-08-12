@@ -2,7 +2,7 @@ FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Install system dependencies (including wget for model weights)
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsm6 \
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install runtime Python dependencies (includes scipy and pyyaml for BasicSR)
+# Install runtime Python dependencies
 RUN pip install --no-cache-dir \
     opencv-python-headless \
     boto3 \
@@ -30,13 +30,13 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir --no-deps basicsr
 RUN pip install --no-cache-dir --no-deps realesrgan
 
-# Force-reinstall and pin NumPy to 1.26.4 (fixes PyTorch C-API incompatibility)
+# Force-reinstall and lock NumPy to 1.26.4 (resolves PyTorch/NumPy 2.x C-API breaking changes)
 RUN pip uninstall -y numpy && pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
 
 # Build-time verification: Confirm NumPy version
 RUN python -c "import numpy; print('=== INSTALLED NUMPY VERSION:', numpy.__version__, '===')"
 
-# Create weights directory and download RealESRGAN_x4plus.pth directly
+# Download RealESRGAN_x4plus weights directly into image during build
 RUN mkdir -p /app/weights && \
     wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O /app/weights/RealESRGAN_x4plus.pth
 
