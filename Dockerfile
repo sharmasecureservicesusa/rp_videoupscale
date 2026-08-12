@@ -13,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Install RunPod SDK and model dependencies
+RUN pip install --no-cache-dir "numpy<2.0.0"
 RUN pip install --no-cache-dir \
     runpod \
     requests \
