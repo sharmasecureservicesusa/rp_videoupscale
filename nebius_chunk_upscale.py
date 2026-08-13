@@ -77,6 +77,7 @@ def split_video(input_file: Path, segment_time: int) -> list[Path]:
         "-c", "copy", "-map", "0",
         "-segment_time", str(segment_time),
         "-f", "segment", "-reset_timestamps", "1",
+        "-movflags", "+faststart",  # CRITICAL: Ensures valid moov atom headers for RunPod ffprobe
         str(chunk_pattern)
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
